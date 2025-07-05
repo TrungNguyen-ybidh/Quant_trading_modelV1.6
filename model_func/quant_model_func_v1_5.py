@@ -460,8 +460,8 @@ def detect_bullish_engulfing(df):
 
 def mark_inside_zones(df, price_col="entry_price"):
     df = df.copy()
-    df["inside_ote_zone"] = 0
-    df["inside_ob_zone"] = 0
+    df["inside_ote_zone"] = True
+    df["inside_ob_zone"] = True
 
     for i in range(len(df)):
         row = df.iloc[i]
@@ -469,11 +469,11 @@ def mark_inside_zones(df, price_col="entry_price"):
 
         if pd.notna(row.get("ote_start")) and pd.notna(row.get("ote_end")):
             if row["ote_start"] <= price <= row["ote_end"]:
-                df.at[df.index[i], "inside_ote_zone"] = True
+                df.at[df.index[i], "inside_ote_zone"] = 1
 
         if pd.notna(row.get("ob_low")) and pd.notna(row.get("ob_high")):
             if row["ob_low"] <= price <= row["ob_high"]:
-                df.at[df.index[i], "inside_ob_zone"] = True
+                df.at[df.index[i], "inside_ob_zone"] = 1
 
     return df
 

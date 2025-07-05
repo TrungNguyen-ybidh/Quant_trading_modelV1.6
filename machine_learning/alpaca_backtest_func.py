@@ -1,20 +1,24 @@
 # alpaca_backtest_func.py (fixed)
 
 import os
+import sys
 import pandas as pd
 from datetime import datetime
 from alpaca_trade_api.rest import REST
 from joblib import load
-from ml_utils_classification import load_model as load_clf, predict_with_model as predict_clf
-from ml_utils_regressor import load_model as load_reg, predict_with_model as predict_reg
-import sys
+
+# Add root directory to sys.path for clean relative imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# === Import quant model core functions ===
 from model_func.quant_model_func_v1_5 import (
     detect_htf_structure, calculate_ote_from_bos, detect_order_blocks, assign_entry_price,
     detect_ltf_structure, mark_ltf_confirmation, detect_bullish_engulfing,
     detect_liquidity_grab, mark_inside_zones, filter_valid_entries,
     set_entry_sl_tp, simulate_trade_outcomes, classify_trend_bias
 )
+
+from ml_utils_combined import apply_ml_models
 
 # --- Alpaca API Setup ---
 def get_alpaca_client(api_key, secret_key):
@@ -70,16 +74,28 @@ def calculate_holding_time(df):
                     break
     return df
 
+import os
+import numpy as np
+from joblib import load
+from ml_utils_combined import apply_ml_models
+
+import os
+import numpy as np
+from joblib import load
+
+import os
+from joblib import load
+from ml_utils_combined import apply_ml_models
+
 def run_backtest_pipeline(
     symbol, alpaca_client,
     ltf_interval="15Min", ltf_period="60d",
     htf_interval="1H", htf_period="6mo",
     confidence_threshold=0.6,
     future_window=20, atr_buffer=0.0,
-    verbose=True
+    verbose=True,
+    use_ml=True
 ):
-    from ml_utils_combined import apply_ml_models
-
     if verbose:
         print(f"\n🔁 Running backtest for {symbol}")
 
@@ -91,7 +107,11 @@ def run_backtest_pipeline(
     htf_df = calculate_ote_from_bos(htf_df)
     htf_df = detect_order_blocks(htf_df)
 
-    latest = htf_df[["ote_start", "ote_end", "ote_dir", "ob_high", "ob_low", "ob_direction", "structure_confidence"]]
+    latest = htf_df[[
+        "ote_start", "ote_end", "ote_dir",
+        "ob_high", "ob_low", "ob_direction",
+        "structure_confidence"
+    ]]
     ltf_df = ltf_df.merge(latest, left_index=True, right_index=True, how="left").ffill()
 
     ltf_df = detect_ltf_structure(ltf_df)
@@ -118,35 +138,53 @@ def run_backtest_pipeline(
     ltf_df["trend_bias"] = ltf_df.get("trend_bias", "unknown")
     ltf_df["entry_zone_type"] = ltf_df.get("entry_zone_type", "none")
     ltf_df["is_valid_entry"] = ltf_df.get("is_valid_entry", False).astype(int)
-    ltf_df["r_multiple"] = ltf_df["r_multiple"].fillna(0)
+    ltf_df["r_multiple"] = ltf_df["r_multiple"].fillna(0).infer_objects(copy=False)
     ltf_df["is_profitable"] = (ltf_df["r_multiple"] > 0).astype(int)
 
     # === ML Enhancement ===
-    try:
-        clf_model = load("machine_learning/ml_model_clf.pkl")
-        clf_scaler = load("machine_learning/ml_model_scaler.pkl")
-        reg_model = load("machine_learning/ml_model_reg.pkl")
-        reg_scaler = load("machine_learning/ml_model_reg_scaler.pkl")
+    if use_ml:
+        try:
+            base_path = r"c:\Users\YoungBossTrungNguyen\OneDrive\Documents\Quant_trading_modelV1.6\machine_learning"
+            clf_model = load(os.path.join(base_path, "ml_model_clf.pkl"))
+            clf_scaler = load(os.path.join(base_path, "ml_model_clf_scaler.pkl"))
+            reg_model = load(os.path.join(base_path, "ml_model_reg.pkl"))
+            reg_scaler = load(os.path.join(base_path, "ml_model_reg_scaler.pkl"))
 
-        ml_candidates = ltf_df[ltf_df["is_valid_entry"] == 1].copy()
+            ml_candidates = ltf_df[ltf_df["is_valid_entry"] == 1].copy()
 
-        if not ml_candidates.empty:
-            ml_scored = apply_ml_models(ml_candidates, clf_model, clf_scaler, reg_model, reg_scaler)
-            ltf_df.loc[ml_scored.index, ["ml_valid_entry", "ml_prob", "ml_r_pred"]] = ml_scored[["ml_valid_entry", "ml_prob", "ml_r_pred"]]
-        else:
+            if not ml_candidates.empty:
+                ml_scored = apply_ml_models(ml_candidates, clf_model, clf_scaler, reg_model, reg_scaler)
+
+                # Initialize columns
+                ltf_df["ml_valid_entry"] = 0
+                ltf_df["ml_prob"] = 0.0
+                ltf_df["ml_r_pred"] = 0.0
+
+                # Fill ML scores
+                ltf_df.loc[ml_scored.index, ["ml_valid_entry", "ml_prob", "ml_r_pred"]] = ml_scored[
+                    ["ml_valid_entry", "ml_prob", "ml_r_pred"]
+                ]
+            else:
+                ltf_df["ml_valid_entry"] = 0
+                ltf_df["ml_prob"] = 0.0
+                ltf_df["ml_r_pred"] = 0.0
+
+            # Final hybrid filter
+            ltf_df["final_entry"] = (ltf_df["is_valid_entry"] == 1) & (ltf_df["ml_valid_entry"] == 1)
+
+        except Exception as e:
+            print("⚠️ ML model could not be loaded/applied:", str(e))
             ltf_df["ml_valid_entry"] = 0
             ltf_df["ml_prob"] = 0.0
             ltf_df["ml_r_pred"] = 0.0
-
-        ltf_df["final_entry"] = (ltf_df["is_valid_entry"] == 1) & (ltf_df["ml_valid_entry"] == 1)
-
-    except Exception as e:
-        print("⚠️ ML model could not be loaded/applied:", str(e))
+            ltf_df["final_entry"] = ltf_df["is_valid_entry"] == 1
+    else:
         ltf_df["ml_valid_entry"] = 0
         ltf_df["ml_prob"] = 0.0
         ltf_df["ml_r_pred"] = 0.0
         ltf_df["final_entry"] = ltf_df["is_valid_entry"] == 1
 
+    # === Summary ===
     if verbose:
         total = len(ltf_df)
         valid_trades = ltf_df["is_valid_entry"].sum()
@@ -156,6 +194,8 @@ def run_backtest_pipeline(
         print(f"✅ Backtest complete: {valid_trades} rule trades, {ml_approved} ML trades, {final_count} hybrid entries, avg R = {avg_r}")
 
     return ltf_df
+
+
 
 # --- Export + Summary Combined ---
 def summarize_and_export(
