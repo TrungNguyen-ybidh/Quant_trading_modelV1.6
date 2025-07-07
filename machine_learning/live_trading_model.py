@@ -30,7 +30,7 @@ def print_trade_summary(symbol, row, qty):
 def run_live_trading_model(
     alpaca_client,
     symbol,
-    ltf_interval="1Min",
+    ltf_interval="15Min",
     lookback_minutes=60,
     confidence_threshold=0.6,
     ml_prob_threshold=0.7,
@@ -42,7 +42,7 @@ def run_live_trading_model(
     trade_qty=1,
     account_balance=10000,
     max_spread_pct=0.002,
-    min_volume=100
+    min_volume=10
 ):
     def to_rfc3339(dt): return dt.replace(microsecond=0).isoformat() + "Z"
     def is_crypto(symbol): return "-USD" in symbol
@@ -73,11 +73,16 @@ def run_live_trading_model(
     start_str = to_rfc3339(start_time)
     conv_symbol = convert_symbol(symbol)
 
+    if is_crypto(symbol):
+        min_volume = 10
+    else:
+        min_volume = 100
+
     try:
         is_c = is_crypto(symbol)
         if is_c:
             df = alpaca_client.get_crypto_bars(conv_symbol, ltf_interval, start=start_str).df
-            df = df[df["exchange"] == "CBSE"] if "exchange" in df.columns else df
+            #df = df[df["exchange"] == "CBSE"] if "exchange" in df.columns else df
         else:
             df = alpaca_client.get_bars(conv_symbol, ltf_interval, start=start_str).df
         df = df.rename(columns=str.title)
@@ -89,9 +94,9 @@ def run_live_trading_model(
         print("\n⚠️ No data received.")
         return None
 
-    if df["Volume"].iloc[-1] < min_volume:
-        print(f"\n⚠️ Volume too low: {df['Volume'].iloc[-1]}")
-        return None
+    if df["Volume"].tail(3).mean() < min_volume:
+        print(f"\n⚠️ Avg volume too low: {df['Volume'].tail(3).mean():.2f}")
+    return None
 
     if not is_spread_acceptable(df):
         print("\n⚠️ Spread too wide, skipping trade.")
@@ -99,9 +104,24 @@ def run_live_trading_model(
 
     ltf_df = df.copy()
 
-    htf_df = ltf_df.resample("1H").agg({
-        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
-    }).dropna()
+    # === Get HTF (1H) data separately ===
+    htf_lookback_minutes = 48 * 60  
+    htf_start_time = now - timedelta(minutes=htf_lookback_minutes)
+    htf_start_str = to_rfc3339(htf_start_time)
+
+    try:
+        if is_c:
+            htf_df = alpaca_client.get_crypto_bars(conv_symbol, "1H", start=htf_start_str).df
+        else:
+            htf_df = alpaca_client.get_bars(conv_symbol, "1H", start=htf_start_str).df
+        htf_df = htf_df.rename(columns=str.title)
+    except Exception as e:
+        print(f"\n❌ Error fetching HTF data: {e}")
+        return None
+
+    if htf_df.empty:
+        print("\n⚠️ No HTF data received.")
+        return None
 
     htf_df = detect_htf_structure(htf_df)
     htf_df = classify_trend_bias(htf_df)
@@ -111,6 +131,35 @@ def run_live_trading_model(
     latest = htf_df[["ote_start", "ote_end", "ote_dir", "ob_high", "ob_low", "ob_direction", "structure_confidence", "trend_bias"]].ffill().iloc[-1:]
     for col in latest.columns:
         ltf_df[col] = latest[col].values[0]
+
+    # === Invalidate OB/OTE zones if already broken ===
+    latest_close = ltf_df["Close"].iloc[-1]
+
+    # Invalidate OB
+    if (
+        ltf_df["ob_direction"].iloc[-1] == "bearish"
+        and latest_close > ltf_df["ob_high"].iloc[-1]
+    ):
+        ltf_df["ob_direction"] = "invalid"
+
+    if (
+        ltf_df["ob_direction"].iloc[-1] == "bullish"
+        and latest_close < ltf_df["ob_low"].iloc[-1]
+    ):
+        ltf_df["ob_direction"] = "invalid"
+
+    # Invalidate OTE
+    if (
+        ltf_df["ote_dir"].iloc[-1] == "bearish"
+        and latest_close > ltf_df["ote_end"].iloc[-1]
+    ):
+        ltf_df["ote_dir"] = "invalid"
+
+    if (
+        ltf_df["ote_dir"].iloc[-1] == "bullish"
+        and latest_close < ltf_df["ote_start"].iloc[-1]
+    ):
+        ltf_df["ote_dir"] = "invalid"
 
     ltf_df = detect_ltf_structure(ltf_df)
     ltf_df = mark_ltf_confirmation(ltf_df, max_lag=30)
@@ -212,13 +261,13 @@ def run_live_trading_model(
 
 def get_alpaca_client(paper=True):
     if paper:
-        base_url = "https://paper-api.alpaca.markets"
-        key_id = os.getenv("ALPACA_PAPER_KEY_ID")
-        secret_key = os.getenv("ALPACA_PAPER_SECRET_KEY")
+        base_url = 'https://paper-api.alpaca.markets/v2'
+        key_id = 'PK5W4A1DDSKJ41IN45I4'
+        secret_key = 'vfrNwYa5Zcp7OAfwnRYr7bKo6CKIo2LVKKiKGZPH'
     else:
-        base_url = "https://api.alpaca.markets"
-        key_id = os.getenv("ALPACA_LIVE_KEY_ID")
-        secret_key = os.getenv("ALPACA_LIVE_SECRET_KEY")
+        base_url = 'https://paper-api.alpaca.markets/v2'
+        key_id = 'PK5W4A1DDSKJ41IN45I4'
+        secret_key = 'vfrNwYa5Zcp7OAfwnRYr7bKo6CKIo2LVKKiKGZPH' 
 
     return tradeapi.REST(key_id, secret_key, base_url, api_version="v2")
 
