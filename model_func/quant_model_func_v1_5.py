@@ -23,32 +23,44 @@ def download_crypto_data(symbol: str,
 
 # --- Structure Confidence Scoring ---
 def calculate_structure_confidence(df, i, atr_window=14, vol_window=20) -> float:
-    """Calculate structure confidence score at index i."""
+    """Enhanced structure confidence score calculation at index i."""
     row = df.iloc[i]
     prev_row = df.iloc[i - 1]
     close = row["Close"]
     volume = row.get("Volume", 1)
 
-    # ATR
+    # === ATR Component ===
     df["H-L"] = df["High"] - df["Low"]
     atr = df["H-L"].rolling(atr_window).mean().iloc[i]
-
-    # Volume spike check
-    avg_vol = df["Volume"].rolling(vol_window).mean().iloc[i]
-    vol_score = 1 if volume > avg_vol else 0
-
-    # Breakout size relative to ATR
     range_broken = abs(close - prev_row["Close"])
-    break_score = min(range_broken / atr, 2) if atr else 0
+    break_score = min(range_broken / atr, 2) if atr else 0  # scale up to 2
 
-    # Candle body score
+    # === Candle Body Component ===
     body = abs(row["Close"] - row["Open"])
     candle_range = row["High"] - row["Low"]
-    body_score = body / candle_range if candle_range else 0
+    body_score = body / candle_range if candle_range else 0  # full-bodied = 1
 
-    # Weighted sum
-    confidence = (0.4 * break_score) + (0.2 * body_score) + (0.2 * vol_score)
+    # === Volume Component (continuous) ===
+    avg_vol = df["Volume"].rolling(vol_window).mean().iloc[i]
+    vol_score = min(volume / avg_vol, 2.0) if avg_vol else 0  # cap at 2.0, normalize
+
+    # === Structure Type Boost ===
+    structure_boost = 0.0
+    if "structure" in row:
+        if row["structure"] == "BOS":
+            structure_boost = 0.2
+        elif row["structure"] == "CHoCH":
+            structure_boost = 0.1
+
+    # === Final Score ===
+    confidence = (
+        0.4 * break_score +
+        0.2 * body_score +
+        0.2 * vol_score +
+        structure_boost
+    )
     return round(min(confidence, 1.0), 2)
+
 
 
 def detect_htf_structure(df, left=2, right=2):
@@ -469,11 +481,11 @@ def mark_inside_zones(df, price_col="entry_price"):
 
         if pd.notna(row.get("ote_start")) and pd.notna(row.get("ote_end")):
             if row["ote_start"] <= price <= row["ote_end"]:
-                df.at[df.index[i], "inside_ote_zone"] = 1
+                df.at[df.index[i], "inside_ote_zone"] = True
 
         if pd.notna(row.get("ob_low")) and pd.notna(row.get("ob_high")):
             if row["ob_low"] <= price <= row["ob_high"]:
-                df.at[df.index[i], "inside_ob_zone"] = 1
+                df.at[df.index[i], "inside_ob_zone"] = True
 
     return df
 

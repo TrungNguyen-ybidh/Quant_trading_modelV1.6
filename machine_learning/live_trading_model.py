@@ -1,13 +1,15 @@
 import os
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 from joblib import load
 from ml_utils_combined import apply_ml_models
 import sys
 import alpaca_trade_api as tradeapi
+import pytz
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+et_tz = pytz.timezone("America/New_York")
 
 from model_func.quant_model_func_v1_5 import (
     detect_htf_structure, calculate_ote_from_bos, detect_order_blocks, assign_entry_price,
@@ -33,8 +35,8 @@ def run_live_trading_model(
     ltf_interval="15Min",
     lookback_minutes=60,
     confidence_threshold=0.6,
-    ml_prob_threshold=0.7,
-    ml_r_threshold=1.0,
+    ml_prob_threshold=0.5,
+    ml_r_threshold=0.8,
     atr_buffer=0.0,
     use_ml=True,
     verbose=True,
@@ -44,7 +46,12 @@ def run_live_trading_model(
     max_spread_pct=0.002,
     min_volume=10
 ):
-    def to_rfc3339(dt): return dt.replace(microsecond=0).isoformat() + "Z"
+    def to_rfc3339(dt):
+        if dt.tzinfo is None:
+            # If naive, assume UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
     def is_crypto(symbol): return "-USD" in symbol
     def convert_symbol(symbol):
         if is_crypto(symbol): return symbol.replace("-USD", "/USD")
@@ -68,7 +75,7 @@ def run_live_trading_model(
             return df["SpreadPct"].iloc[-1] <= max_spread_pct
         return True
 
-    now = datetime.utcnow()
+    now = datetime.now(et_tz)
     start_time = now - timedelta(minutes=lookback_minutes)
     start_str = to_rfc3339(start_time)
     conv_symbol = convert_symbol(symbol)
@@ -86,6 +93,7 @@ def run_live_trading_model(
         else:
             df = alpaca_client.get_bars(conv_symbol, ltf_interval, start=start_str).df
         df = df.rename(columns=str.title)
+        df.index = df.index.tz_convert(et_tz)
     except Exception as e:
         print(f"\n❌ Error fetching live data: {e}")
         return None
@@ -94,9 +102,9 @@ def run_live_trading_model(
         print("\n⚠️ No data received.")
         return None
 
-    if df["Volume"].tail(3).mean() < min_volume:
+    if not is_crypto(symbol) and df["Volume"].tail(3).mean() < min_volume:
         print(f"\n⚠️ Avg volume too low: {df['Volume'].tail(3).mean():.2f}")
-    return None
+        return None
 
     if not is_spread_acceptable(df):
         print("\n⚠️ Spread too wide, skipping trade.")
@@ -105,7 +113,7 @@ def run_live_trading_model(
     ltf_df = df.copy()
 
     # === Get HTF (1H) data separately ===
-    htf_lookback_minutes = 48 * 60  
+    htf_lookback_minutes = 12 * 60  
     htf_start_time = now - timedelta(minutes=htf_lookback_minutes)
     htf_start_str = to_rfc3339(htf_start_time)
 
@@ -115,6 +123,7 @@ def run_live_trading_model(
         else:
             htf_df = alpaca_client.get_bars(conv_symbol, "1H", start=htf_start_str).df
         htf_df = htf_df.rename(columns=str.title)
+        htf_df.index = htf_df.index.tz_convert(et_tz)
     except Exception as e:
         print(f"\n❌ Error fetching HTF data: {e}")
         return None
@@ -128,7 +137,44 @@ def run_live_trading_model(
     htf_df = calculate_ote_from_bos(htf_df)
     htf_df = detect_order_blocks(htf_df)
 
-    latest = htf_df[["ote_start", "ote_end", "ote_dir", "ob_high", "ob_low", "ob_direction", "structure_confidence", "trend_bias"]].ffill().iloc[-1:]
+    # === HTF Summary Counts ===
+    htf_bos_count = (htf_df["market_structure"] == "BOS").sum()
+    htf_choch_count = (htf_df["market_structure"] == "CHoCH").sum()
+
+    latest_ote_zone = htf_df[["ote_start", "ote_end", "ote_dir"]].dropna().iloc[-1:]
+    latest_ob_zone = htf_df[["ob_high", "ob_low", "ob_direction"]].dropna().iloc[-1:]
+    
+    entered_ote_zone = False
+    entered_ob_zone = False
+    latest_close = df["Close"].iloc[-1]
+
+    if not latest_ote_zone.empty:
+        if latest_ote_zone["ote_dir"].values[0] == "bullish" and latest_ote_zone["ote_start"].values[0] <= latest_close <= latest_ote_zone["ote_end"].values[0]:
+            entered_ote_zone = True
+        elif latest_ote_zone["ote_dir"].values[0] == "bearish" and latest_ote_zone["ote_end"].values[0] <= latest_close <= latest_ote_zone["ote_start"].values[0]:
+            entered_ote_zone = True
+
+    if not latest_ob_zone.empty:
+        if latest_ob_zone["ob_direction"].values[0] == "bullish" and latest_ob_zone["ob_low"].values[0] <= latest_close <= latest_ob_zone["ob_high"].values[0]:
+            entered_ob_zone = True
+        elif latest_ob_zone["ob_direction"].values[0] == "bearish" and latest_ob_zone["ob_high"].values[0] >= latest_close >= latest_ob_zone["ob_low"].values[0]:
+            entered_ob_zone = True
+
+    print(f"\n📈 HTF Summary for {symbol}:")
+    print(f"  • BOS count: {htf_bos_count}")
+    print(f"  • CHoCH count: {htf_choch_count}")
+    print(f"  • Price inside OTE zone: {'✅' if entered_ote_zone else '❌'}")
+    print(f"  • Price inside OB zone: {'✅' if entered_ob_zone else '❌'}")
+
+    latest = htf_df[[
+        "ote_start", "ote_end", "ote_dir",
+        "ob_high", "ob_low", "ob_direction",
+        "structure_confidence", "trend_bias"
+    ]].ffill()
+
+    latest = latest.infer_objects(copy=False).iloc[-1:]
+
+    latest = latest.infer_objects(copy=False).iloc[-1:]
     for col in latest.columns:
         ltf_df[col] = latest[col].values[0]
 
@@ -170,9 +216,12 @@ def run_live_trading_model(
     ltf_df = filter_valid_entries(ltf_df, confidence_threshold=confidence_threshold)
     ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
 
+    print(f"\n📊 Post structure detection for {symbol} (last few rows):")
+    print(ltf_df[["is_valid_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
+
     if use_ml:
         try:
-            base_path = r"c:\\Users\\YoungBossTrungNguyen\\OneDrive\\Documents\\Quant_trading_modelV1.6\\machine_learning"
+            base_path = r"/Users/tnguyen287/Documents/quant_model_v1.6/machine_learning"
             clf_model = load(os.path.join(base_path, "ml_model_clf.pkl"))
             clf_scaler = load(os.path.join(base_path, "ml_model_clf_scaler.pkl"))
             reg_model = load(os.path.join(base_path, "ml_model_reg.pkl"))
@@ -183,7 +232,11 @@ def run_live_trading_model(
                 ml_scored = apply_ml_models(ml_candidates, clf_model, clf_scaler, reg_model, reg_scaler)
                 ltf_df.loc[ml_scored.index, ["ml_valid_entry", "ml_prob", "ml_r_pred"]] = ml_scored[["ml_valid_entry", "ml_prob", "ml_r_pred"]]
 
-            ltf_df["ml_valid_entry"] = ltf_df.get("ml_valid_entry", 0).fillna(0)
+            for col, default in [("ml_valid_entry", 0), ("ml_prob", 0.0), ("ml_r_pred", 0.0)]:
+                if col not in ltf_df.columns:
+                    ltf_df[col] = default
+                else:
+                    ltf_df[col] = ltf_df[col].fillna(default)
             ltf_df["ml_prob"] = ltf_df.get("ml_prob", 0.0).fillna(0.0)
             ltf_df["ml_r_pred"] = ltf_df.get("ml_r_pred", 0.0).fillna(0.0)
         except Exception as e:
@@ -197,6 +250,12 @@ def run_live_trading_model(
         ((ltf_df["ote_dir"] == "bullish") & (ltf_df["trend_bias"] == "bullish")) |
         ((ltf_df["ote_dir"] == "bearish") & (ltf_df["trend_bias"] == "bearish"))
     )
+
+    # === Debug: Check what entries passed before final filtering ===
+    print(f"\n🧪 Candidates before ML filtering for {symbol}:")
+    print(ltf_df[ltf_df["is_valid_entry"] == 1][[
+        "ml_prob", "ml_r_pred", "ml_valid_entry", "ote_dir", "trend_bias", "is_closed_bar"
+    ]].tail(5))  # tail(5) gives you a few more rows
 
     ltf_df["final_entry"] = (
         (ltf_df["is_valid_entry"] == 1) &
@@ -308,7 +367,7 @@ def check_and_close_trades(alpaca_client, log_path="executed_trades_log.csv"):
             closed.append({
                 **row,
                 "exit_price": exit_price,
-                "exit_time": datetime.utcnow(),
+                "exit_time": datetime.now(timezone.utc),
                 "result": exit_reason,
                 "r_multiple": r_multiple,
                 "status": "closed"
