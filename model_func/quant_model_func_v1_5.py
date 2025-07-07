@@ -478,34 +478,6 @@ def mark_inside_zones(df, price_col="entry_price"):
     return df
 
 
-
-def filter_valid_entries_2(df, confidence_threshold=0.6):
-    df = df.copy()
-    df["is_valid_entry"] = False
-
-    for i in range(len(df)):
-        row = df.iloc[i]
-
-        if not row.get("inside_ote_zone") and not row.get("inside_ob_zone"):
-            continue
-        if not row.get("choch_before"):
-            continue
-        if not row.get("bos_after_choch"):
-            continue
-        if not row.get("liquidity_grab"):
-            continue
-        if not row.get("structure_confidence") or row["structure_confidence"] < confidence_threshold:
-            continue
-
-        # Optional: bullish engulfing confirmation
-        if not row.get("bullish_engulfing"):
-            continue
-
-        df.at[df.index[i], "is_valid_entry"] = True
-
-    return df
-
-
 def set_entry_sl_tp(df, risk_multiple_1=1.5, risk_multiple_2=2.5, atr_buffer=0.0):
     df = df.copy()
     for col in ["entry_price", "stop_loss", "take_profit_1", "take_profit_2", "rr_1", "rr_2"]:

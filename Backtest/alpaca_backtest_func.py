@@ -18,7 +18,7 @@ from model_func.quant_model_func_v1_5 import (
     set_entry_sl_tp, simulate_trade_outcomes, classify_trend_bias
 )
 
-from ml_utils_combined import apply_ml_models
+from machine_learning.ml_utils_combined import apply_ml_models
 
 # --- Alpaca API Setup ---
 def get_alpaca_client(api_key, secret_key):
@@ -77,7 +77,7 @@ def calculate_holding_time(df):
 import os
 import numpy as np
 from joblib import load
-from ml_utils_combined import apply_ml_models
+from machine_learning.ml_utils_combined import apply_ml_models
 
 import os
 import numpy as np
@@ -85,7 +85,7 @@ from joblib import load
 
 import os
 from joblib import load
-from ml_utils_combined import apply_ml_models
+from machine_learning.ml_utils_combined import apply_ml_models
 
 def run_backtest_pipeline(
     symbol, alpaca_client,
