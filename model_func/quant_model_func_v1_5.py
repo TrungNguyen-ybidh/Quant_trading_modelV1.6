@@ -231,47 +231,6 @@ def detect_order_blocks(df, direction="bullish", window=5):
     return df
 
 
-# Combine detect_order_blocks and calculate_ote_from_bos into a unified pipeline that retains OB/OTE zone boundaries.
-
-def detect_order_blocks(df, direction="bullish", window=5):
-    """
-    Detect valid order blocks near BOS in HTF based on trend direction.
-    Adds columns: ['ob_high', 'ob_low', 'ob_time', 'ob_direction']
-    """
-    df = df.copy()
-    df["ob_high"] = None
-    df["ob_low"] = None
-    df["ob_time"] = None
-    df["ob_direction"] = None
-
-    for i in range(window, len(df)):
-        row = df.iloc[i]
-
-        if row["market_structure"] != "BOS":
-            continue
-        if direction == "bullish" and row.get("trend_bias") != "bullish":
-            continue
-        if direction == "bearish" and row.get("trend_bias") != "bearish":
-            continue
-
-        window_df = df.iloc[i - window:i]
-
-        if direction == "bullish":
-            candidates = window_df[window_df["Close"] < window_df["Open"]]  # bearish candles
-        else:
-            candidates = window_df[window_df["Close"] > window_df["Open"]]  # bullish candles
-
-        if candidates.empty:
-            continue
-
-        last_ob = candidates.iloc[-1]
-        df.at[df.index[i], "ob_high"] = last_ob["High"]
-        df.at[df.index[i], "ob_low"] = last_ob["Low"]
-        df.at[df.index[i], "ob_time"] = last_ob.name
-        df.at[df.index[i], "ob_direction"] = direction
-
-    return df
-
 def calculate_ote_from_bos(df, lookback=10):
     """
     Calculate OTE (Optimal Trade Entry) zone from BOS using recent swing range.
@@ -323,124 +282,223 @@ def calculate_ote_from_bos(df, lookback=10):
 
 def detect_ltf_structure(df, left=2, right=2):
     """
-    Detect microstructure shifts on LTF using swing highs/lows.
+    Detect LTF microstructure shifts (BOS/CHoCH) using swing highs and lows.
 
     Parameters:
-        df (pd.DataFrame): Price data with 'High', 'Low', 'Close'.
-        left/right (int): Bars to check for swing pivots.
+        df (pd.DataFrame): Must contain 'High', 'Low', 'Close' columns.
+        left/right (int): Number of bars to the left/right to consider a swing.
 
     Returns:
-        pd.DataFrame: With columns ['lt_swing_high', 'lt_swing_low', 'market_structure']
+        pd.DataFrame: Adds ['lt_swing_high', 'lt_swing_low', 'lt_structure']
     """
     df = df.copy()
-
-    # Identify swing highs/lows
     df["lt_swing_high"] = df["High"][
-        (df["High"].shift(left) < df["High"]) & 
-        (df["High"].shift(-right) < df["High"])
+        (df["High"].shift(left) > df["High"]) & 
+        (df["High"].shift(-right) > df["High"])
     ]
     df["lt_swing_low"] = df["Low"][
-        (df["Low"].shift(left) > df["Low"]) & 
-        (df["Low"].shift(-right) > df["Low"])
+        (df["Low"].shift(left) < df["Low"]) & 
+        (df["Low"].shift(-right) < df["Low"])
     ]
+    df["lt_structure"] = None
 
-    df["market_structure"] = None
-    last_trend, last_high, last_low = None, None, None
+    last_trend = None
+    last_high = None
+    last_low = None
 
-    for i in range(len(df)):
+    for i in range(max(left, right), len(df)):
         row = df.iloc[i]
+        close = row["Close"]
 
-        # Track most recent swings
+        # Update recent swings
         if not pd.isna(row["lt_swing_high"]):
             last_high = row["lt_swing_high"]
         if not pd.isna(row["lt_swing_low"]):
             last_low = row["lt_swing_low"]
 
-        # Skip early rows
-        if i < max(left, right):
-            continue
-
-        close = row["Close"]
-
-        # Structure detection logic
         if last_trend is None:
-            if last_high and close > last_high:
-                df.at[df.index[i], "market_structure"] = "BOS"
+            if last_high is not None and close > last_high:
+                df.at[df.index[i], "lt_structure"] = "BOS"
                 last_trend = "bullish"
-            elif last_low and close < last_low:
-                df.at[df.index[i], "market_structure"] = "BOS"
+            elif last_low is not None and close < last_low:
+                df.at[df.index[i], "lt_structure"] = "BOS"
                 last_trend = "bearish"
         elif last_trend == "bullish":
-            if last_low and close < last_low:
-                df.at[df.index[i], "market_structure"] = "CHoCH"
+            if last_low is not None and close < last_low:
+                df.at[df.index[i], "lt_structure"] = "CHoCH"
                 last_trend = "bearish"
-            elif last_high and close > last_high:
-                df.at[df.index[i], "market_structure"] = "BOS"
+            elif last_high is not None and close > last_high:
+                df.at[df.index[i], "lt_structure"] = "BOS"
         elif last_trend == "bearish":
-            if last_high and close > last_high:
-                df.at[df.index[i], "market_structure"] = "CHoCH"
+            if last_high is not None and close > last_high:
+                df.at[df.index[i], "lt_structure"] = "CHoCH"
                 last_trend = "bullish"
-            elif last_low and close < last_low:
-                df.at[df.index[i], "market_structure"] = "BOS"
+            elif last_low is not None and close < last_low:
+                df.at[df.index[i], "lt_structure"] = "BOS"
 
     return df
 
 
-
 def mark_ltf_confirmation(df, max_lag=10):
     """
-    Identify LTF confirmation structure: CHoCH followed by BOS within lag window.
+    Mark LTF confirmation (CHoCH → BOS) only when price is inside OB or OTE zone.
 
     Parameters:
-        df (pd.DataFrame): DataFrame with 'lt_structure' (structure label on LTF).
-        max_lag (int): Number of bars to look back for CHoCH -> BOS sequence.
+        df (pd.DataFrame): DataFrame with 'lt_structure', 'inside_ob_zone', 'inside_ote_zone'
+        max_lag (int): How many previous bars to look for CHoCH → BOS pattern
 
     Returns:
-        pd.DataFrame: With confirmation flags ['choch_before', 'bos_after_choch']
+        pd.DataFrame: Adds 'choch_before' and 'bos_after_choch' flags
     """
     df = df.copy()
     df["choch_before"] = False
     df["bos_after_choch"] = False
 
     for i in range(max_lag, len(df)):
-        recent = df.iloc[i - max_lag:i]
-        choch_idx = recent[recent["lt_structure"] == "CHoCH"].index
-        bos_idx = recent[recent["lt_structure"] == "BOS"].index
+        row = df.iloc[i]
 
-        if not choch_idx.empty and not bos_idx.empty:
-            if choch_idx[-1] < bos_idx[-1]:
-                df.at[df.index[i], "choch_before"] = True
-                df.at[df.index[i], "bos_after_choch"] = True
+        # ✅ Only look for confirmation if price is inside OB or OTE zone
+        if not (row.get("inside_ob_zone", False) or row.get("inside_ote_zone", False)):
+            continue
+
+        # Lookback window for CHoCH → BOS
+        recent = df.iloc[i - max_lag:i]
+        choch_positions = recent[recent["lt_structure"] == "CHoCH"].index
+        bos_positions = recent[recent["lt_structure"] == "BOS"].index
+
+        # Confirmation: CHoCH appears before BOS
+        if any(c < b for c in choch_positions for b in bos_positions):
+            df.at[df.index[i], "choch_before"] = True
+            df.at[df.index[i], "bos_after_choch"] = True
 
     return df
 
 
 def detect_liquidity_grab(df, lookback=5):
     """
-    Detect wick-only liquidity grabs that fail to close beyond prior swing zones.
+    Detect directional wick-based liquidity grabs with confirmation filters.
 
     Parameters:
-        df (pd.DataFrame): Must include 'High', 'Low', and 'Close'.
-        lookback (int): Lookback window for prior highs/lows.
+        df (pd.DataFrame): Must include ['High', 'Low', 'Open', 'Close', 
+                                         'inside_ob_zone', 'inside_ote_zone'].
+        lookback (int): Number of prior candles to compare for swing highs/lows.
 
     Returns:
-        pd.DataFrame: With 'liquidity_grab' flag (bool)
+        pd.DataFrame: Adds ['liquidity_grab'] (bool) and ['grab_direction'] ('up', 'down', or None).
     """
     df = df.copy()
     df["liquidity_grab"] = False
+    df["grab_direction"] = None
 
     for i in range(lookback, len(df)):
         row = df.iloc[i]
-        prev_highs = df.iloc[i - lookback:i]["High"]
-        prev_lows = df.iloc[i - lookback:i]["Low"]
+        high_slice = df.iloc[i - lookback:i]["High"]
+        low_slice = df.iloc[i - lookback:i]["Low"]
+        prev_high = high_slice.max()
+        prev_low = low_slice.min()
 
-        # Wick above highs but failed to close above
-        if row["High"] > prev_highs.max() and row["Close"] < prev_highs.max():
-            df.at[df.index[i], "liquidity_grab"] = True
-        # Wick below lows but failed to close below
-        elif row["Low"] < prev_lows.min() and row["Close"] > prev_lows.min():
-            df.at[df.index[i], "liquidity_grab"] = True
+        open_price = row["Open"]
+        close_price = row["Close"]
+        high = row["High"]
+        low = row["Low"]
 
+        body = abs(close_price - open_price)
+        upper_wick = high - max(open_price, close_price)
+        lower_wick = min(open_price, close_price) - low
+
+        # Only check for grabs if inside OB/OTE zone
+        if not row.get("inside_ob_zone", False) and not row.get("inside_ote_zone", False):
+            continue
+
+        # Grab above previous highs (fake breakout up)
+        if high > prev_high and close_price < prev_high and upper_wick > body:
+            df.at[df.index[i], "liquidity_grab"] = True
+            df.at[df.index[i], "grab_direction"] = "up"
+
+        # Grab below previous lows (fake breakdown down)
+        elif low < prev_low and close_price > prev_low and lower_wick > body:
+            df.at[df.index[i], "liquidity_grab"] = True
+            df.at[df.index[i], "grab_direction"] = "down"
+
+    return df
+
+
+def mark_zone_session(df):
+    """
+    Marks persistent session where price is inside OB or OTE zone.
+    Adds 'zone_session_id' column to track sessions.
+    """
+    df = df.copy()
+    in_session = False
+    session_ids = []
+    session_id = 0
+
+    for i, row in df.iterrows():
+        inside = row.get("inside_ob_zone", False) or row.get("inside_ote_zone", False)
+        if inside:
+            if not in_session:
+                session_id += 1
+                in_session = True
+            session_ids.append(session_id)
+        else:
+            in_session = False
+            session_ids.append(None)
+
+    df["zone_session_id"] = session_ids
+    return df
+
+def accumulate_zone_confirmations(df):
+    """
+    Accumulates confirmations during each OB/OTE zone session.
+    Returns updated DataFrame with persistent confirmation flags.
+    """
+    df = mark_zone_session(df)
+    df["sticky_choch"] = False
+    df["sticky_bos_after_choch"] = False
+    df["sticky_engulfing"] = False
+    df["sticky_liquidity_grab"] = False
+
+    for session_id in df["zone_session_id"].dropna().unique():
+        session_mask = df["zone_session_id"] == session_id
+        session_df = df[session_mask]
+
+        choch_seen = False
+        bos_seen = False
+        engulf_seen = False
+        grab_seen = False
+
+        for idx in session_df.index:
+            row = df.loc[idx]
+
+            if row.get("lt_structure") == "CHoCH":
+                choch_seen = True
+            if row.get("lt_structure") == "BOS" and choch_seen:
+                bos_seen = True
+            if row.get("bullish_engulfing"):
+                engulf_seen = True
+            if row.get("liquidity_grab"):
+                grab_seen = True
+
+            df.at[idx, "sticky_choch"] = choch_seen
+            df.at[idx, "sticky_bos_after_choch"] = bos_seen
+            df.at[idx, "sticky_engulfing"] = engulf_seen
+            df.at[idx, "sticky_liquidity_grab"] = grab_seen
+
+    return df
+
+def mark_final_entry(df, confidence_threshold=0.6, require_liquidity=False, require_bos=False):
+    """
+    Final entry logic using accumulated confirmations.
+    Returns df with 'final_entry' boolean column.
+    """
+    df = accumulate_zone_confirmations(df)
+    df["final_entry"] = (
+        (df["structure_confidence"] >= confidence_threshold)
+        & df["sticky_choch"]
+        & (df["sticky_bos_after_choch"] if require_bos else True)
+        & (df["sticky_liquidity_grab"] if require_liquidity else True)
+        & df["sticky_engulfing"]
+    )
     return df
 
 
@@ -654,6 +712,48 @@ def filter_valid_entries(df, confidence_threshold=0.6):
                 df.at[df.index[i], "setup_type"] = "OTE"
 
     return df
+
+
+def filter_valid_entries_1(df, confidence_threshold=0.55):
+    df = df.copy()
+    df["is_valid_entry"] = False
+    df["confirmation_count"] = 0
+    df["entry_zone_type"] = None
+    df["setup_type"] = None
+
+    for i in range(len(df)):
+        row = df.iloc[i]
+
+        def check_conditions():
+            count = 0
+            if row.get("choch_before"):
+                count += 1
+            if row.get("bullish_engulfing"):
+                count += 1
+            if row.get("bos_after_choch"):   # optional bonus
+                count += 1
+            if row.get("liquidity_grab"):    # optional bonus
+                count += 1
+            return count
+
+        confirmations = check_conditions()
+        df.at[df.index[i], "confirmation_count"] = confirmations
+
+        # OB prioritized
+        if row.get("inside_ob_zone") and confirmations >= 2 and row.get("structure_confidence", 0) >= confidence_threshold:
+            df.at[df.index[i], "is_valid_entry"] = True
+            df.at[df.index[i], "entry_zone_type"] = "OB"
+            df.at[df.index[i], "setup_type"] = "OB"
+            continue
+
+        # OTE fallback
+        if row.get("inside_ote_zone") and confirmations >= 2 and row.get("structure_confidence", 0) >= confidence_threshold:
+            df.at[df.index[i], "is_valid_entry"] = True
+            df.at[df.index[i], "entry_zone_type"] = "OTE"
+            df.at[df.index[i], "setup_type"] = "OTE"
+
+    return df
+
 
 
 def assign_entry_price(df, method="Low"):

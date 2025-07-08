@@ -55,13 +55,14 @@ while True:
 
         # 🕐 Time-based Filter
         if symbol in ["MSFT", "NVDA"]:
-            if now.hour < 9 or (now.hour == 9 and now.minute < 30) or now.hour >= 16:
+        # Stock: allow from 07:00 to 16:00 (inclusive)
+            if now.hour < 7 or now.hour >= 16:
                 print(f"⏳ Skipping {symbol}: outside US stock hours ({now.strftime('%H:%M')})")
                 continue
+
         elif symbol in ["BTC-USD", "ETH-USD", "SOL-USD"]:
-            if now.hour not in list(range(2, 5)) + list(range(9, 18)):
-                print(f"🌙 Skipping {symbol}: outside active crypto hours ({now.strftime('%H:%M')})")
-                continue
+        # Crypto: run 24/7, no time restriction
+            pass  # No time filter
 
         # 📊 Run Trading Logic
         try:
@@ -96,7 +97,7 @@ while True:
     # 💰 Update PnL and Stop Conditions
     if not os.path.exists(closed_trades_file):
         print("⚠️ Closed trades file not found. Skipping PnL update.")
-        wait_until_next_15_min()
+        time.sleep(900)
         continue
 
     try:
@@ -125,9 +126,6 @@ while True:
     except Exception as e:
         print(f"❌ Error updating state: {e}")
 
-    wait_until_next_15_min()
-    et_now = datetime.now(et_tz)
-    print(f"\n🕒 Loop running at {et_now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-
+    time.sleep(900)
 
 

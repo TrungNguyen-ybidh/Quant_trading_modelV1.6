@@ -12,10 +12,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 et_tz = pytz.timezone("America/New_York")
 
 from model_func.quant_model_func_v1_5 import (
-    detect_htf_structure, calculate_ote_from_bos, detect_order_blocks, assign_entry_price,
-    detect_ltf_structure, mark_ltf_confirmation, detect_bullish_engulfing,
-    detect_liquidity_grab, mark_inside_zones, filter_valid_entries,
-    set_entry_sl_tp, classify_trend_bias
+    detect_htf_structure, calculate_structure_confidence, detect_order_blocks,
+    calculate_ote_from_bos, assign_entry_price, mark_inside_zones,
+    detect_bullish_engulfing, detect_ltf_structure, mark_zone_session,
+    accumulate_zone_confirmations, mark_final_entry, set_entry_sl_tp,
+    classify_trend_bias, mark_ltf_confirmation, detect_liquidity_grab
 )
 
 def print_trade_summary(symbol, row, qty):
@@ -28,6 +29,7 @@ def print_trade_summary(symbol, row, qty):
     print(f"\u2022 ML Confidence: {row['ml_prob']:.2f}")
     print(f"\u2022 ML R Prediction: {row['ml_r_pred']:.2f}")
     print(f"\u2022 Structure Confidence: {row['structure_confidence']:.2f}")
+
 
 def run_live_trading_model(
     alpaca_client,
@@ -113,7 +115,7 @@ def run_live_trading_model(
     ltf_df = df.copy()
 
     # === Get HTF (1H) data separately ===
-    htf_lookback_minutes = 12 * 60  
+    htf_lookback_minutes = 7 * 24 * 60  
     htf_start_time = now - timedelta(minutes=htf_lookback_minutes)
     htf_start_str = to_rfc3339(htf_start_time)
 
@@ -136,6 +138,8 @@ def run_live_trading_model(
     htf_df = classify_trend_bias(htf_df)
     htf_df = calculate_ote_from_bos(htf_df)
     htf_df = detect_order_blocks(htf_df)
+    htf_df = calculate_structure_confidence(htf_df)
+    htf_df = mark_inside_zones(htf_df)
 
     # === HTF Summary Counts ===
     htf_bos_count = (htf_df["market_structure"] == "BOS").sum()
@@ -178,46 +182,70 @@ def run_live_trading_model(
     for col in latest.columns:
         ltf_df[col] = latest[col].values[0]
 
-    # === Invalidate OB/OTE zones if already broken ===
-    latest_close = ltf_df["Close"].iloc[-1]
+        # === Invalidate OB/OTE zones if already broken ===
+        latest_close = ltf_df["Close"].iloc[-1]
 
-    # Invalidate OB
-    if (
-        ltf_df["ob_direction"].iloc[-1] == "bearish"
-        and latest_close > ltf_df["ob_high"].iloc[-1]
-    ):
-        ltf_df["ob_direction"] = "invalid"
+        # Invalidate OB
+        if (
+            ltf_df["ob_direction"].iloc[-1] == "bearish"
+            and latest_close > ltf_df["ob_high"].iloc[-1]
+        ):
+            ltf_df["ob_direction"] = "invalid"
 
-    if (
-        ltf_df["ob_direction"].iloc[-1] == "bullish"
-        and latest_close < ltf_df["ob_low"].iloc[-1]
-    ):
-        ltf_df["ob_direction"] = "invalid"
+        if (
+            ltf_df["ob_direction"].iloc[-1] == "bullish"
+            and latest_close < ltf_df["ob_low"].iloc[-1]
+        ):
+            ltf_df["ob_direction"] = "invalid"
 
-    # Invalidate OTE
-    if (
-        ltf_df["ote_dir"].iloc[-1] == "bearish"
-        and latest_close > ltf_df["ote_end"].iloc[-1]
-    ):
-        ltf_df["ote_dir"] = "invalid"
+        # Invalidate OTE
+        if (
+            ltf_df["ote_dir"].iloc[-1] == "bearish"
+            and latest_close > ltf_df["ote_end"].iloc[-1]
+        ):
+            ltf_df["ote_dir"] = "invalid"
 
-    if (
-        ltf_df["ote_dir"].iloc[-1] == "bullish"
-        and latest_close < ltf_df["ote_start"].iloc[-1]
-    ):
-        ltf_df["ote_dir"] = "invalid"
+        if (
+            ltf_df["ote_dir"].iloc[-1] == "bullish"
+            and latest_close < ltf_df["ote_start"].iloc[-1]
+        ):
+            ltf_df["ote_dir"] = "invalid"
 
-    ltf_df = detect_ltf_structure(ltf_df)
-    ltf_df = mark_ltf_confirmation(ltf_df, max_lag=30)
-    ltf_df = detect_liquidity_grab(ltf_df)
-    ltf_df = detect_bullish_engulfing(ltf_df)
-    ltf_df = assign_entry_price(ltf_df, method="Low")
-    ltf_df = mark_inside_zones(ltf_df)
-    ltf_df = filter_valid_entries(ltf_df, confidence_threshold=confidence_threshold)
-    ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
+        ltf_df = detect_ltf_structure(ltf_df)
+        ltf_df = mark_ltf_confirmation(ltf_df, max_lag=30)
+        ltf_df = detect_liquidity_grab(ltf_df)
+        ltf_df = detect_bullish_engulfing(ltf_df)
+        ltf_df = assign_entry_price(ltf_df, method="Low")
+        ltf_df = mark_zone_session(ltf_df)
+        ltf_df = calculate_structure_confidence(ltf_df)
+        ltf_df = accumulate_zone_confirmations(ltf_df)
+        ltf_df = mark_final_entry(ltf_df)
+        ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
 
-    print(f"\n📊 Post structure detection for {symbol} (last few rows):")
-    print(ltf_df[["is_valid_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
+        # Optional: print summary of final signals
+        print(f"\n📊 Post structure detection for {symbol} (last few rows):")
+        print(ltf_df[["final_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
+
+        print(f"\n🔍 Entry Confirmation Breakdown for {symbol}:")
+        recent = ltf_df.tail(5)  
+        for idx, row in recent.iterrows():  
+            print(f"🕓 {idx}")
+            print(f"  • structure_confidence: {row.get('structure_confidence')}")
+            print(f"  • inside_ob_zone: {row.get('inside_ob_zone')}")
+            print(f"  • inside_ote_zone: {row.get('inside_ote_zone')}")
+            print(f"  • choch_before: {row.get('choch_before')}")
+            print(f"  • bos_after_choch: {row.get('bos_after_choch')}")
+            print(f"  • liquidity_grab: {row.get('liquidity_grab')}")
+            print(f"  • bullish_engulfing: {row.get('bullish_engulfing')}")
+            print(f"  • confirmation_count: {row.get('confirmation_count')}")
+            print(f"  • final_entry: {row.get('final_entry')}")
+            print(f"  • entry_zone_type: {row.get('entry_zone_type')}")
+            print(f"  • setup_type: {row.get('setup_type')}")
+            print("-" * 40)
+        ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
+
+        print(f"\n📊 Post structure detection for {symbol} (last few rows):")
+        print(ltf_df[["final_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
 
     if use_ml:
         try:
@@ -227,7 +255,7 @@ def run_live_trading_model(
             reg_model = load(os.path.join(base_path, "ml_model_reg.pkl"))
             reg_scaler = load(os.path.join(base_path, "ml_model_reg_scaler.pkl"))
 
-            ml_candidates = ltf_df[ltf_df["is_valid_entry"] == 1].copy()
+            ml_candidates = ltf_df[ltf_df["final_entry"] == 1].copy()
             if not ml_candidates.empty:
                 ml_scored = apply_ml_models(ml_candidates, clf_model, clf_scaler, reg_model, reg_scaler)
                 ltf_df.loc[ml_scored.index, ["ml_valid_entry", "ml_prob", "ml_r_pred"]] = ml_scored[["ml_valid_entry", "ml_prob", "ml_r_pred"]]
@@ -253,12 +281,12 @@ def run_live_trading_model(
 
     # === Debug: Check what entries passed before final filtering ===
     print(f"\n🧪 Candidates before ML filtering for {symbol}:")
-    print(ltf_df[ltf_df["is_valid_entry"] == 1][[
+    print(ltf_df[ltf_df["final_entry"] == 1][[
         "ml_prob", "ml_r_pred", "ml_valid_entry", "ote_dir", "trend_bias", "is_closed_bar"
     ]].tail(5))  # tail(5) gives you a few more rows
 
-    ltf_df["final_entry"] = (
-        (ltf_df["is_valid_entry"] == 1) &
+    ltf_df["ml_entry_approve"] = (
+        (ltf_df["final_entry"] == 1) &
         (ltf_df["ml_valid_entry"] == 1) &
         (ltf_df["ml_prob"] >= ml_prob_threshold) &
         (ltf_df["ml_r_pred"] >= ml_r_threshold) &
@@ -266,7 +294,7 @@ def run_live_trading_model(
         (ltf_df["trend_align"])
     )
 
-    signal_df = ltf_df[ltf_df["final_entry"] == 1].copy().tail(1)
+    signal_df = ltf_df[ltf_df["ml_entry_approve"] == 1].copy().tail(1)
 
     if not signal_df.empty:
         print("\n✅ LIVE SIGNAL FOUND:")
