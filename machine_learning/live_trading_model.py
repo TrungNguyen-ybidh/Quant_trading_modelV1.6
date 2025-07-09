@@ -11,8 +11,8 @@ import pytz
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 et_tz = pytz.timezone("America/New_York")
 
-from model_func.quant_model_func_v1_5 import (
-    detect_htf_structure, calculate_structure_confidence, detect_order_blocks,
+from model_func.quant_model_func_v1_6 import (
+    detect_htf_structure, detect_order_blocks,
     calculate_ote_from_bos, assign_entry_price, mark_inside_zones,
     detect_bullish_engulfing, detect_ltf_structure, mark_zone_session,
     accumulate_zone_confirmations, mark_final_entry, set_entry_sl_tp,
@@ -112,7 +112,7 @@ def run_live_trading_model(
         print("\n⚠️ Spread too wide, skipping trade.")
         return None
 
-    ltf_df = df.copy()
+    ltf_df = df.copy()  
 
     # === Get HTF (1H) data separately ===
     htf_lookback_minutes = 7 * 24 * 60  
@@ -138,7 +138,6 @@ def run_live_trading_model(
     htf_df = classify_trend_bias(htf_df)
     htf_df = calculate_ote_from_bos(htf_df)
     htf_df = detect_order_blocks(htf_df)
-    htf_df = calculate_structure_confidence(htf_df)
     htf_df = mark_inside_zones(htf_df)
 
     # === HTF Summary Counts ===
@@ -179,71 +178,86 @@ def run_live_trading_model(
     latest = latest.infer_objects(copy=False).iloc[-1:]
 
     latest = latest.infer_objects(copy=False).iloc[-1:]
+    # Apply latest HTF zone values
     for col in latest.columns:
         ltf_df[col] = latest[col].values[0]
 
-        # === Invalidate OB/OTE zones if already broken ===
-        latest_close = ltf_df["Close"].iloc[-1]
+    # === Invalidate OB/OTE zones if already broken ===
+    latest_close = ltf_df["Close"].iloc[-1]
 
-        # Invalidate OB
-        if (
-            ltf_df["ob_direction"].iloc[-1] == "bearish"
-            and latest_close > ltf_df["ob_high"].iloc[-1]
-        ):
-            ltf_df["ob_direction"] = "invalid"
+    if (
+        ltf_df["ob_direction"].iloc[-1] == "bearish"
+        and latest_close > ltf_df["ob_high"].iloc[-1]
+    ):
+        ltf_df["ob_direction"] = "invalid"
 
-        if (
-            ltf_df["ob_direction"].iloc[-1] == "bullish"
-            and latest_close < ltf_df["ob_low"].iloc[-1]
-        ):
-            ltf_df["ob_direction"] = "invalid"
+    if (
+        ltf_df["ob_direction"].iloc[-1] == "bullish"
+        and latest_close < ltf_df["ob_low"].iloc[-1]
+    ):
+        ltf_df["ob_direction"] = "invalid"
 
-        # Invalidate OTE
-        if (
-            ltf_df["ote_dir"].iloc[-1] == "bearish"
-            and latest_close > ltf_df["ote_end"].iloc[-1]
-        ):
-            ltf_df["ote_dir"] = "invalid"
+    if (
+        ltf_df["ote_dir"].iloc[-1] == "bearish"
+        and latest_close > ltf_df["ote_end"].iloc[-1]
+    ):
+        ltf_df["ote_dir"] = "invalid"
 
-        if (
-            ltf_df["ote_dir"].iloc[-1] == "bullish"
-            and latest_close < ltf_df["ote_start"].iloc[-1]
-        ):
-            ltf_df["ote_dir"] = "invalid"
+    if (
+        ltf_df["ote_dir"].iloc[-1] == "bullish"
+        and latest_close < ltf_df["ote_start"].iloc[-1]
+    ):
+        ltf_df["ote_dir"] = "invalid"
 
-        ltf_df = detect_ltf_structure(ltf_df)
-        ltf_df = mark_ltf_confirmation(ltf_df, max_lag=30)
-        ltf_df = detect_liquidity_grab(ltf_df)
-        ltf_df = detect_bullish_engulfing(ltf_df)
-        ltf_df = assign_entry_price(ltf_df, method="Low")
-        ltf_df = mark_zone_session(ltf_df)
-        ltf_df = calculate_structure_confidence(ltf_df)
-        ltf_df = accumulate_zone_confirmations(ltf_df)
-        ltf_df = mark_final_entry(ltf_df)
-        ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
+    # === Run structure and entry logic ONCE ===
+    ltf_df = detect_ltf_structure(ltf_df)
+    ltf_df = mark_ltf_confirmation(ltf_df, max_lag=30)
+    ltf_df = detect_liquidity_grab(ltf_df)
+    ltf_df = detect_bullish_engulfing(ltf_df)
+    required_cols = ["Open", "High", "Low", "Close"]
+    if not all(col in ltf_df.columns for col in required_cols):
+        print(f"\n❌ {symbol} missing required OHLC columns: {ltf_df.columns.tolist()}")
+        return None
+
+    if ltf_df.empty or ltf_df["Low"].isnull().all():
+        print(f"\n❌ {symbol} entry_price assignment failed: Low column missing or empty")
+        return None
+    ltf_df = assign_entry_price(ltf_df, method="Low")
+    if "entry_price" not in ltf_df.columns:
+        print(f"❌ {symbol}: 'entry_price' column missing after assign_entry_price.")
+    else:
+        null_count = ltf_df['entry_price'].isnull().sum()
+    print(f"✅ {symbol}: 'entry_price' column assigned. Null count: {null_count}")
+    ltf_df = mark_inside_zones(ltf_df)
+    ltf_df["timestamp"] = ltf_df.index  # ✅ safely add timestamp as a column
+    print(ltf_df[["timestamp", "entry_price"]].tail(3))
+    ltf_df = mark_zone_session(ltf_df)
+    ltf_df = accumulate_zone_confirmations(ltf_df)
+    ltf_df = mark_final_entry(ltf_df)
+    ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
+
 
         # Optional: print summary of final signals
-        print(f"\n📊 Post structure detection for {symbol} (last few rows):")
-        print(ltf_df[["final_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
+    # === Print debug summary ===
+    print(f"\n📊 Post structure detection for {symbol} (last few rows):")
+    print(ltf_df[["final_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
 
-        print(f"\n🔍 Entry Confirmation Breakdown for {symbol}:")
-        recent = ltf_df.tail(5)  
-        for idx, row in recent.iterrows():  
-            print(f"🕓 {idx}")
-            print(f"  • structure_confidence: {row.get('structure_confidence')}")
-            print(f"  • inside_ob_zone: {row.get('inside_ob_zone')}")
-            print(f"  • inside_ote_zone: {row.get('inside_ote_zone')}")
-            print(f"  • choch_before: {row.get('choch_before')}")
-            print(f"  • bos_after_choch: {row.get('bos_after_choch')}")
-            print(f"  • liquidity_grab: {row.get('liquidity_grab')}")
-            print(f"  • bullish_engulfing: {row.get('bullish_engulfing')}")
-            print(f"  • confirmation_count: {row.get('confirmation_count')}")
-            print(f"  • final_entry: {row.get('final_entry')}")
-            print(f"  • entry_zone_type: {row.get('entry_zone_type')}")
-            print(f"  • setup_type: {row.get('setup_type')}")
-            print("-" * 40)
-        ltf_df = set_entry_sl_tp(ltf_df, atr_buffer=atr_buffer)
-
+    print(f"\n🔍 Entry Confirmation Breakdown for {symbol}:")
+    recent = ltf_df.tail(5)  
+    for idx, row in recent.iterrows():  
+        print(f"🕓 {idx}")
+        print(f"  • structure_confidence: {row.get('structure_confidence')}")
+        print(f"  • inside_ob_zone: {row.get('inside_ob_zone')}")
+        print(f"  • inside_ote_zone: {row.get('inside_ote_zone')}")
+        print(f"  • choch_before: {row.get('choch_before')}")
+        print(f"  • bos_after_choch: {row.get('bos_after_choch')}")
+        print(f"  • liquidity_grab: {row.get('liquidity_grab')}")
+        print(f"  • bullish_engulfing: {row.get('bullish_engulfing')}")
+        print(f"  • confirmation_count: {row.get('confirmation_count')}")
+        print(f"  • final_entry: {row.get('final_entry')}")
+        print(f"  • entry_zone_type: {row.get('entry_zone_type')}")
+        print(f"  • setup_type: {row.get('setup_type')}")
+        print("-" * 40)
         print(f"\n📊 Post structure detection for {symbol} (last few rows):")
         print(ltf_df[["final_entry", "structure_confidence", "inside_ob_zone", "bullish_engulfing", "liquidity_grab", "entry_price"]].tail(5))
 
@@ -293,56 +307,63 @@ def run_live_trading_model(
         (ltf_df["is_closed_bar"]) &
         (ltf_df["trend_align"])
     )
-
+    ltf_df["final_entry"] = ltf_df["final_entry"] & ltf_df["entry_price"].notnull()
     signal_df = ltf_df[ltf_df["ml_entry_approve"] == 1].copy().tail(1)
 
     if not signal_df.empty:
-        print("\n✅ LIVE SIGNAL FOUND:")
-        print(signal_df[["timestamp", "entry_price", "stop_loss", "ml_prob", "ml_r_pred", "structure_confidence"]])
+        required_cols = ["entry_price", "stop_loss", "ml_prob", "ml_r_pred", "structure_confidence"]
+        if all(col in signal_df.columns for col in required_cols):
+            row = signal_df.iloc[0]
+            if pd.isnull(row["entry_price"]):
+                print(f"⚠️ {symbol}: 'entry_price' is NaN in signal row.")
+            else:
+                print("\n✅ LIVE SIGNAL FOUND:")
+                print(signal_df[["timestamp", "entry_price", "stop_loss", "ml_prob", "ml_r_pred", "structure_confidence"]])
 
-        if execute_trade:
-            try:
-                row = signal_df.iloc[0]
-                qty = calculate_position_size(
-                    row["entry_price"], row["stop_loss"],
-                    account_balance, 0.02,
-                    row["ml_prob"], row["ml_r_pred"]
-                )
-                limit_price = round(row["entry_price"] * (1 + 0.001), 2)
+                if execute_trade:
+                    try:
+                        qty = calculate_position_size(
+                            row["entry_price"], row["stop_loss"],
+                            account_balance, 0.02,
+                            row["ml_prob"], row["ml_r_pred"]
+                        )
+                        limit_price = round(row["entry_price"] * (1 + 0.001), 2)
 
-                alpaca_client.submit_order(
-                    symbol=symbol,
-                    qty=qty,
-                    side="buy",
-                    type="limit",
-                    limit_price=limit_price,
-                    time_in_force="gtc"
-                )
-                print(f"\n🚀 Limit order placed for {symbol} at {limit_price} with quantity {qty}.")
-                print_trade_summary(symbol, row, qty)
+                        alpaca_client.submit_order(
+                            symbol=symbol,
+                            qty=qty,
+                            side="buy",
+                            type="limit",
+                            limit_price=limit_price,
+                            time_in_force="gtc"
+                        )
+                        print(f"\n🚀 Limit order placed for {symbol} at {limit_price} with quantity {qty}.")
+                        print_trade_summary(symbol, row, qty)
 
-                # Log to open_trades.csv
-                open_log = "open_trades.csv"
-                trade_row = {
-                    "timestamp": row.name,
-                    "symbol": symbol,
-                    "entry_price": row["entry_price"],
-                    "stop_loss": row["stop_loss"],
-                    "take_profit": row.get("take_profit", np.nan),
-                    "qty": qty,
-                    "ml_prob": row["ml_prob"],
-                    "ml_r_pred": row["ml_r_pred"],
-                    "structure_confidence": row["structure_confidence"],
-                    "status": "open"
-                }
-                header = not os.path.exists(open_log)
-                pd.DataFrame([trade_row]).to_csv(open_log, mode="a", header=header, index=False)
-                print(f"📁 Trade recorded to {open_log} (awaiting close)")
+                        # Log to open_trades.csv
+                        open_log = "open_trades.csv"
+                        trade_row = {
+                            "timestamp": row.name,
+                            "symbol": symbol,
+                            "entry_price": row["entry_price"],
+                            "stop_loss": row["stop_loss"],
+                            "take_profit": row.get("take_profit", np.nan),
+                            "qty": qty,
+                            "ml_prob": row["ml_prob"],
+                            "ml_r_pred": row["ml_r_pred"],
+                            "structure_confidence": row["structure_confidence"],
+                            "status": "open"
+                        }
+                        header = not os.path.exists(open_log)
+                        pd.DataFrame([trade_row]).to_csv(open_log, mode="a", header=header, index=False)
+                        print(f"📁 Trade recorded to {open_log} (awaiting close)")
 
-            except Exception as e:
-                print(f"\n❌ Trade execution failed: {e}")
+                    except Exception as e:
+                        print(f"\n❌ Trade execution failed: {e}")
+        else:
+            print(f"⚠️ {symbol}: Missing required columns in signal_df: {signal_df.columns.tolist()}")
     else:
-        print("\n🚫 No valid trade signal found.")
+        print(f"\n🚫 No valid trade signal found for {symbol}.")
 
     return signal_df
 
